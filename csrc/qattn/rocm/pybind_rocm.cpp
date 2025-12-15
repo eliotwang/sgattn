@@ -20,7 +20,5 @@
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
 {
-  // m.def("simple_gemm", &simple_ge1d, "rocWMMA:");
   m.def("qk_int8_sv_f8_accum_f32_attn", &launch_sgattn, "QK int8 sv f8 accum f32 attn");
-  // m.def("qk_int8_sv_f8_accum_f32_attn", &qk_int8_sv_f8_accum_f32_attn, "QK int8 sv f8 accum f32 attn");
 }

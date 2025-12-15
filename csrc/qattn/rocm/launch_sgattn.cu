@@ -1,8 +1,4 @@
-//#include "attn_rocm_gfx942.h"
 #include "dispatch_utils.h"
-// #include "attn_utils.h"
-// #include "qk_gemm_hip.hip"
-// #include "sv_gemm_hip.hip"
 #include "sgattn.hip"
 #include <hip/hip_fp8.h> 
 #include <c10/core/DeviceGuard.h> 
@@ -29,30 +25,15 @@
 #include <torch/serialize/tensor.h>
 #include <ATen/ATen.h>
 #include <ATen/Functions.h>
-//#include "utils.h"
-// #include <torch/indexing.h>   // Slice
+#include "args.hpp"
 
-using torch::indexing::Slice;
-
-static inline uint32_t align_up_128(uint32_t x) {
-  return (x + 127u) & ~127u;
-}
-
-#ifndef HIP_CHECK
-#define HIP_CHECK(cmd)                                                                  \
-  do {                                                                                  \
-    hipError_t e = (cmd);                                                               \
-    if (e != hipSuccess) {                                                              \
-      printf("HIP error %s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(e));         \
-      abort();                                                                          \
-    }                                                                                   \
-  } while (0)
-#endif
 
 #ifdef __ROCM_ARCH_GFX942
   using fp8_type = __hip_fp8_e4m3_fnuz;
+  namespace Params = gfx9Params;
 #else
   using fp8_type = __hip_fp8_e4m3;
+  namespace Params = gfx11Params;
 #endif
 
 torch::Tensor launch_sgattn(torch::Tensor query,
@@ -88,7 +69,6 @@ torch::Tensor launch_sgattn(torch::Tensor query,
   CHECK_DTYPE(query, torch::kInt8);
   CHECK_DTYPE(key, torch::kInt8);
   // TODO: how to check fp8 data type?
-  // CHECK_DTYPE(value, torch::kHalf);
   CHECK_DTYPE(query_scale, torch::kFloat32);
   CHECK_DTYPE(key_scale, torch::kFloat32);
   CHECK_DTYPE(value_scale, torch::kFloat32);
@@ -112,18 +92,14 @@ torch::Tensor launch_sgattn(torch::Tensor query,
     auto Q_pad = pad_seq128(query);   // [B,Hq,M_pad,D]
     auto K_pad = pad_seq128(key);     // [B,Hk,N_pad,D]
     auto O_pad = at::zeros(Q_pad.sizes(), output.options().dtype(torch::kFloat)).contiguous();
-    // auto O_pad = pad_seq128(output);
 
     int M = query.size(2);
     int N = key.size(2);
     int M_pad = (query.size(2) + 127) / 128 * 128;
     int N_pad = (key.size(2) + 127) / 128 * 128;
     
-    // value 被 per_channel_fp8 转置为 [B, H, D, N_padded]
-    // 保持转置后的布局，不要再转回来
     auto V_pad = value.contiguous();  // [B,H,D,N_padded]
 
-    auto T = at::zeros({64, 64}, output.options().dtype(torch::kInt)).contiguous();
     const int batch_size = Q_pad.size(0);
     const int head_dim = Q_pad.size(3);
 
@@ -185,22 +161,32 @@ torch::Tensor launch_sgattn(torch::Tensor query,
 
                         if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp))
                         {
-                        CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q));
-                        CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K));
+                          CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q));
+                          CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K));
                         }
                         else if constexpr (QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread))
                         {
-                        // CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q) * 8);
-                        // CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K) * 4);    
+                          CHECK_SHAPE(query_scale, batch_size, num_qo_heads, div_ceil(qo_len, CTA_Q) * (CTA_Q / WARP_Q) * 8);
+                          CHECK_SHAPE(key_scale, batch_size, num_kv_heads, div_ceil(kv_len, CTA_K) * (CTA_K / WARP_K) * 4);    
                         }
                         else
                         {
-                        static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp) || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread), "Unsupported quantization granularity");
+                          static_assert(QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerWarp) || QK_QUANT_GRAN == static_cast<int>(QuantGranularity::kPerThread), "Unsupported quantization granularity");
                         }
 
-                        //                                     smem_Q                                     smem_K                            smem_V                     smem_O
-                        size_t smem_max = std::max(2u * sizeof(int8_t) * (64 + 64) * 32, 1u * sizeof(float) * 64 * 64);
-                      
+                        uint32_t ROCWMMA_M = Params::ROCWMMA_M;
+                        uint32_t ROCWMMA_N = Params::ROCWMMA_N;
+                        uint32_t ROCWMMA_K = Params::ROCWMMA_K;
+                        uint32_t BLOCKS_X  = Params::BLOCKS_X;
+                        uint32_t BLOCKS_Y  = Params::BLOCKS_Y;
+                        uint32_t TBLOCK_X  = Params::TBLOCK_X;
+                        uint32_t TBLOCK_Y  = Params::TBLOCK_Y;
+                        uint32_t WARP_SIZE = Params::WARP_SIZE;
+
+                        const size_t Mx = (size_t)ROCWMMA_M * BLOCKS_X * TBLOCK_X / WARP_SIZE;
+                        const size_t My = (size_t)ROCWMMA_N * BLOCKS_Y * TBLOCK_Y;
+                        size_t smem_max = std::max(2u * sizeof(int8_t) * (Mx + My) * ROCWMMA_K, 1u * sizeof(float) * Mx * My);
+
                         hipFuncSetAttribute(
                             (const void*)qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
                                                                 static_cast<QuantGranularity>(QK_QUANT_GRAN),
@@ -212,7 +198,7 @@ torch::Tensor launch_sgattn(torch::Tensor query,
                             (int)smem_max);
                         
                         dim3 grid(div_ceil(M_pad, 64), num_qo_heads, batch_size);
-                        dim3 block(128, 1);
+                        dim3 block(256, 1);
 
                         hipLaunchKernelGGL((qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
                             static_cast<QuantGranularity>(QK_QUANT_GRAN),
