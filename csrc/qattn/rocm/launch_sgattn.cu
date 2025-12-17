@@ -197,8 +197,8 @@ torch::Tensor launch_sgattn(torch::Tensor query,
                             hipFuncAttributeMaxDynamicSharedMemorySize,
                             (int)smem_max);
                         
-                        dim3 grid(div_ceil(M_pad, 64), num_qo_heads, batch_size);
-                        dim3 block(256, 1);
+                        dim3 grid(div_ceil(M_pad, Mx), num_qo_heads, batch_size);
+                        dim3 block(TBLOCK_X, TBLOCK_Y);
 
                         hipLaunchKernelGGL((qk_int_sv_f8_attn_kernel<CTA_Q, CTA_K, WARP_Q, WARP_K, HEAD_DIM, DataType::kInt8,
                             static_cast<QuantGranularity>(QK_QUANT_GRAN),

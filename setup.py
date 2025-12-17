@@ -22,7 +22,8 @@ import warnings
 from packaging.version import parse, Version
 
 from setuptools import setup, find_packages
-
+import torch
+from torch.utils.cpp_extension import BuildExtension, CUDAExtension, CUDA_HOME
 # Skip CUDA build in CI or when explicitly requested
 SKIP_CUDA_BUILD = (
     os.getenv("SAGEATTN_SKIP_CUDA_BUILD", "0").upper() in {"1", "TRUE", "YES"}
@@ -258,7 +259,7 @@ elif not SKIP_CUDA_BUILD:
     # Fused kernels and QAttn variants
     from torch.utils.cpp_extension import CUDAExtension
 
-    if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM100 or HAS_SM120 or HAS_SM121:
+    if HAS_SM80 or HAS_SM86 or HAS_SM89 or HAS_SM90 or HAS_SM120:
         ext_modules.append(
             CUDAExtension(
                 name="sageattention._qattn_sm80",
@@ -270,7 +271,7 @@ elif not SKIP_CUDA_BUILD:
             )
         )
 
-    if HAS_SM89 or HAS_SM90 or HAS_SM100 or HAS_SM120 or HAS_SM121:
+    if HAS_SM89 or HAS_SM120:
         ext_modules.append(
             CUDAExtension(
                 name="sageattention._qattn_sm89",
@@ -301,6 +302,7 @@ elif not SKIP_CUDA_BUILD:
             )
         )
 
+# Fused kernels.
     ext_modules.append(
         CUDAExtension(
             name="sageattention._fused",

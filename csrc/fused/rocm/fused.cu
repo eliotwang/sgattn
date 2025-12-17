@@ -34,18 +34,6 @@
 #include <ATen/ATen.h>
 #include <ATen/Functions.h>
 
-// enum __hip_fp8_interpretation_t {
-//   __HIP_E4M3 = 0,      /**< OCP E4M3 */
-//   __HIP_E5M2 = 1,      /**< OCP E5M2 */
-//   __HIP_E4M3_FNUZ = 2, /**< Standard FP8*/
-//   __HIP_E5M2_FNUZ = 3, /**< BF8 */
-// };
-
-// enum __hip_saturation_t {
-//   __HIP_NOSAT = 0,     /**< No saturation */
-//   __HIP_SATFINITE = 1, /**< Saturate to finite */
-// };
-
 enum class QuantType
 {
   kInt8,
@@ -55,16 +43,10 @@ enum class QuantType
 __device__ __forceinline__ float u32_as_f32(uint32_t u) {
   union { uint32_t u; float f; } v{u}; return v.f;
 }
-__device__ __forceinline__ uint32_t f32_as_u32(float f) {
-  union { uint32_t u; float f; } v{0}; v.f = f; return v.u;
-}
+
 __device__ __forceinline__ uint16_t bf16_bits(__hip_bfloat16 x) {
   return *reinterpret_cast<const uint16_t*>(&x);
 }
-__device__ __forceinline__ __hip_bfloat16 bits_to_bf16(uint16_t b) {
-  __hip_bfloat16 x; *reinterpret_cast<uint16_t*>(&x) = b; return x;
-}
-
 
 // ========== to-float ==========
 template <typename T>
@@ -88,21 +70,6 @@ template <>
 __device__ __forceinline__ float convert_to_float<hip_bfloat16>(hip_bfloat16 v) {
   return convert_to_float(*reinterpret_cast<const __hip_bfloat16*>(&v));
 }
-
-// template <typename T>
-// __device__ __forceinline__ float convert_to_float(T val) {
-//   // static_assert(std::is_same<T, __half>::value ||
-//   //               std::is_same<T, __hip_bfloat16>::value,
-//   //               "Only __half and __hip_bfloat16 are supported (ROCm).");
-
-//   if constexpr (std::is_same<T, __half>::value) {
-//     // fp16 -> f32
-//     return __half2float(val);
-//   } else {
-//     // bf16 -> f32
-//     return __bfloat162float(val);
-//   }
-// }
 
 template <typename T>
 __device__ __forceinline__ T convert_from_float(float val) {
@@ -132,75 +99,9 @@ namespace detail {
     }
   }
 
-  template<typename T>
-  __device__ __forceinline__ void load_8xT_to_regs(const T* __restrict__ ptr, T (&dst)[8]) {
-    static_assert(sizeof(T) == 2, "T must be 16-bit (half/bfloat16)");
-    const uint4* __restrict__ src = reinterpret_cast<const uint4*>(ptr);
-    *reinterpret_cast<uint4*>(&dst[0]) = *src;
-  }
-
   __device__ __forceinline__ void store_8fp8(const uint32_t* __restrict__ fp8x4,
                                            int8_t* __restrict__ out) {
     *reinterpret_cast<uint2*>(out) = *reinterpret_cast<const uint2*>(fp8x4);
-  }
-
-  // ---- E4M3 打包：float32 -> uint8（rn、satfinite、非 subnormal）----
-  // E4M3：1|4|3，bias=7；rn-even；satfinite；不产生 subnormal（下溢置0）
-  __device__ __forceinline__ uint8_t float_to_e4m3_rn_satfinite_relaxed(float x) {
-    const uint8_t POS_MAX_CODE = 0x76;
-    const uint8_t NEG_MAX_CODE = 0xF6;
-    const uint8_t NAN_CODE        = (uint8_t)((15 << 3) | 1);
-    
-    if (isnan(x)) {
-    // canonical NaN (positive sign); any mant != 0 is NaN
-    return NAN_CODE;
-    }
-    if (!isfinite(x)) return signbit(x) ? NEG_MAX_CODE : POS_MAX_CODE;
-    if (x == 0.0f)    return 0u;
-
-    const uint8_t s = signbit(x) ? 0x80 : 0x00;
-    float ax = fabsf(x);
-
-    // 最小正规值 = 2^(1-bias) = 2^-6
-    if (ax < (1.0f / 64.0f)) return s | 0x00;  // 不做 subnormal：直接 0
-
-    // 规格化 ax = m * 2^e，m∈[1,2)
-    int   e;
-    float m = frexpf(ax, &e);   // m∈[0.5,1)
-    m *= 2.0f; e -= 1;          // m∈[1,2)
-
-    // 量化 3 位尾数（去掉隐含 1）：mant = rn_even((m-1)*8)
-    float mant_f  = (m - 1.0f) * 8.0f;  // ∈[0,8)
-    float floor_v = floorf(mant_f);
-    float frac_v  = mant_f - floor_v;
-
-    int mant;
-    if      (frac_v > 0.5f) mant = (int)floor_v + 1;
-    else if (frac_v < 0.5f) mant = (int)floor_v;
-    else                    mant = ((int)floor_v & 1) ? (int)floor_v + 1 : (int)floor_v;
-
-    // 尾数进位：mant==8 -> mant=0, e+1
-    if (mant == 8) { mant = 0; e += 1; }
-
-    // 带偏置指数
-    int eb = e + 7;
-
-    // 下溢：不做 subnormal，直接 0
-    if (eb <= 0) return s | 0x00;
-
-    // ------- 关键改动：指数=15 的处理规则 -------
-    // 仅当 eb==15 且 mant==7 时，判定为“上溢”（你定义的溢出码）；
-    // 其他 eb==15 且 mant!=7 的情况，按“有效数”编码（非常规做法，需上下游一致解码）。
-    if (eb >= 0xF) {
-        // eb==15 且 mant==7 -> 上溢（饱和到“最大码”）
-        // 这里沿用你原有的“最大有限值”码（exp=14,mant=7），或你也可以选择返回 (15,7) 本码
-      return s ? NEG_MAX_CODE : POS_MAX_CODE;
-    }
-
-    // 常规（eb=1..14）
-    uint8_t e_bits = (uint8_t)(eb & 0xF);
-    uint8_t m_bits = (uint8_t)(mant & 0x7);
-    return s | (e_bits << 3) | m_bits;
   }
 
   __device__ __forceinline__ void floatx4_to_e4m3x4(uint32_t* dest, float* s0, float* s1) {
